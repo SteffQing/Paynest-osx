@@ -7,7 +7,7 @@ pragma solidity ^0.8.17;
  */
 interface IPayments {
     // Events
-    event PaymentScheduleActive(
+    event ScheduleActive(
         string indexed username,
         address token,
         uint40 nextPayout,
@@ -16,7 +16,6 @@ interface IPayments {
     event StreamActive(
         string indexed username,
         address token,
-        uint40 startDate,
         uint40 endDate,
         uint256 amount
     );
@@ -25,12 +24,48 @@ interface IPayments {
         address token,
         uint256 amount
     );
-    event StreamPaymentExecuted(
+
+    /**
+     * @dev Emitted when a payout is successfully processed.
+     * @param username The username associated with the stream.
+     * @param token The token address used for the payout.
+     * @param amount The amount paid out.
+     */
+    event Payout(
         string indexed username,
-        address token,
+        address indexed token,
         uint256 amount
     );
-    event UserAddressUpdated(string indexed username, address newAddress);
+
+    /**
+     * @dev Emitted when a payment stream is canceled.
+     * @param username The username associated with the canceled stream.
+     */
+    event PaymentStreamCancelled(string indexed username);
+
+    /**
+     * @dev Emitted when a payment schedule is canceled.
+     * @param username The username associated with the canceled schedule.
+     */
+    event PaymentScheduleCancelled(string indexed username);
+
+    /**
+     * @dev Emitted when a stream is updated with a new amount.
+     * This event logs the updated stream information for a given username.
+     *
+     * @param username The username of the user whose stream has been updated.
+     * @param amount The new amount set for the stream.
+     */
+    event StreamUpdated(string indexed username, uint amount);
+
+    /**
+     * @dev Emitted when a payment schedule is updated with a new amount.
+     * This event logs the updated schedule information for a given username.
+     *
+     * @param username The username of the user whose schedule has been updated.
+     * @param amount The new amount set for the schedule.
+     */
+    event ScheduleUpdated(string indexed username, uint amount);
 
     /**
      * @dev Represents a scheduled payment, including both recurring and one-time payments.
@@ -53,7 +88,6 @@ interface IPayments {
      * @dev Represents a stream payment.
         A mapping of username to this struct defines the payment stream
      * @param token The token address used for the payment.
-     * @param startDate The timestamp when the stream starts.
      * @param endDate The timestamp when the stream ends.
      * @param active Indicates whether the stream is active.
      * @param amount The amount to be streamed per second.
@@ -61,41 +95,11 @@ interface IPayments {
      */
     struct Stream {
         address token;
-        uint40 startDate;
         uint40 endDate;
         bool active;
         uint256 amount;
         uint40 lastPayout;
     }
-
-    /**
-     * @notice Allows a user to claim a username.
-     * @dev This function allows a user to claim a username.
-     * @param username The username to claim.
-     */
-    function claimUsername(string calldata username) external;
-
-    /**
-     * @notice Updates the wallet address for a given username.
-     * @dev This function allows an authorized address to update the mapping of username to wallet address.
-     *      Only specific addresses (e.g., admin or authorized addresses) can call this function.
-     * @param username The username whose wallet address needs to be updated.
-     * @param userAddress The new wallet address to associate with the username.
-     */
-    function updateUserAddress(
-        string calldata username,
-        address userAddress
-    ) external;
-
-    /**
-     * @notice Retrieves the wallet address associated with a given username.
-     * @dev This function allows anyone to check the wallet address associated with a specific username.
-     * @param username The username whose wallet address is to be retrieved.
-     * @return The wallet address associated with the username.
-     */
-    function getUserAddress(
-        string calldata username
-    ) external view returns (address);
 
     /**
      * @notice Creates a scheduled payment for a username
@@ -126,18 +130,6 @@ interface IPayments {
     ) external;
 
     /**
-     * @notice Executes a scheduled payment if due
-     * @param username The username whose payment to execute
-     */
-    function executePayment(string calldata username) external;
-
-    /**
-     * @notice Executes a stream payment
-     * @param username The username whose stream to execute
-     */
-    function executeStream(string calldata username) external;
-
-    /**
      * @notice Retrieves the current stream details for a user.
      * @param username The username to query stream against.
      * @return stream The stream information.
@@ -154,4 +146,69 @@ interface IPayments {
     function getSchedule(
         string calldata username
     ) external view returns (Schedule memory schedule);
+
+    /**
+     * @notice Requests a payout of accumulated funds.
+     * @dev Allows anyone to request a payout of funds from the contract.
+     * @param username The username of the recipient who will receive the payment.
+     */
+    function requestStreamPayout(string calldata username) external payable;
+
+    /**
+     * @notice Requests a payout of scheduled funds.
+     * @dev Allows anyone to request a payout of funds from the contract.
+     * @param username The username of the recipient who will receive the payment.
+     */
+    function requestSchedulePayout(string calldata username) external payable;
+
+    /**
+     * @notice Cancels an active payment stream.
+     * @dev Disables the specified stream and stops further payouts.
+     * @param username The username associated with the payment stream.
+     */
+    function cancelStream(string calldata username) external;
+
+    /**
+     * @notice Cancels an active payment schedule with prorated payout for the current interval.
+     * @dev Computes and transfers the prorated amount for the current interval, then disables the schedule.
+     * @param username The username associated with the payment schedule.
+     */
+    function cancelSchedule(string calldata username) external;
+
+    /**
+     * @dev Edits the amount for an active stream for a given user.
+     * Only the owner can call this function.
+     * Reverts if the amount is zero or the payment stream is not active.
+     *
+     * @param username The username of the user whose stream is to be edited.
+     * @param amount The new amount to set for the stream.
+     *
+     * Requirements:
+     * - The caller must be the owner of the contract.
+     * - The amount must be non-zero.
+     * - The stream for the given username must be active.
+     *
+     * Emits:
+     * - A `StreamUpdated` event with the updated stream information.
+     */
+    function editStream(string calldata username, uint amount) external;
+
+    /**
+     * @dev Edits the amount for a schedule payment for a given user.
+     * Only the owner can call this function.
+     * Reverts if the amount is zero, the payment schedule is not active, or the next payout is within 3 days.
+     *
+     * @param username The username of the user whose schedule is to be edited.
+     * @param amount The new amount to set for the schedule.
+     *
+     * Requirements:
+     * - The caller must be the owner of the contract.
+     * - The amount must be non-zero.
+     * - The schedule for the given username must be active.
+     * - The time difference between the current timestamp and the next payout must be greater than 3 days.
+     *
+     * Emits:
+     * - A `ScheduleUpdated` event with the updated schedule information.
+     */
+    function editSchedule(string calldata username, uint amount) external;
 }

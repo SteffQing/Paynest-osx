@@ -7,13 +7,22 @@ import {IPayments} from "./interfaces/IPayments.sol";
 import {Errors} from "./util/Errors.sol";
 import {SafeERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "./interfaces/IRegistry.sol";
+import "./util/ReentrancyGuard.sol";
 
 /**
  * @title Payments Plugin
  * @notice A plugin that manages payment schedules and streams, executing them through the DAO.
  */
-contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
+contract PaymentsPlugin is
+    PluginUUPSUpgradeable,
+    IPayments,
+    Errors,
+    ReentrancyGuard
+{
     using SafeERC20 for IERC20;
+    IRegistry private immutable Registry =
+        IRegistry(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE); // Need to manually set this
 
     bytes32 public constant CREATE_PAYMENT_PERMISSION_ID =
         keccak256("CREATE_PAYMENT_PERMISSION");
@@ -25,8 +34,9 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
         keccak256("EXECUTE_PAYMENT_PERMISSION");
 
     address internal constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint40 private constant INTERVAL = uint40(30 days);
+    uint40 private constant EDIT_TIMEOUT = uint40(3 days);
 
-    mapping(string => address) private userDirectory;
     mapping(string => Schedule) private schedulePayment;
     mapping(string => Stream) private streamPayment;
 
@@ -36,36 +46,13 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
         __PluginUUPSUpgradeable_init(_dao);
     }
 
-    function updateUserAddress(
-        string calldata username,
-        address userAddress
-    ) external override {
-        if (userDirectory[username] != msg.sender) {
-            revert NotAuthorized();
-        }
-
-        userDirectory[username] = userAddress;
-
-        emit UserAddressUpdated(username, userAddress);
-    }
-
-    function getUserAddress(
-        string calldata username
-    ) external view override returns (address) {
-        return userDirectory[username];
-    }
-
     function createSchedule(
         string calldata username,
         uint256 amount,
         address token,
         uint40 oneTimePayoutDate
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
-        address userAddress = userDirectory[username];
-
-        if (userAddress == address(0)) {
-            revert UserNotFound(username);
-        }
+        Registry.getUserAddress(username);
 
         if (amount == 0) revert InvalidAmount();
 
@@ -74,9 +61,7 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
 
         uint40 _now = uint40(block.timestamp);
         bool isOneTime = oneTimePayoutDate > _now;
-        uint40 nextPayout = isOneTime
-            ? oneTimePayoutDate
-            : (_now + uint40(30 days));
+        uint40 nextPayout = isOneTime ? oneTimePayoutDate : (_now + INTERVAL);
 
         schedulePayment[username] = Schedule(
             token,
@@ -85,20 +70,7 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
             true,
             amount
         );
-        emit PaymentScheduleActive(username, token, nextPayout, amount);
-    }
-
-    function claimUsername(string calldata username) external override {
-        if (bytes(username).length == 0) {
-            revert EmptyUsernameNotAllowed();
-        }
-
-        if (userDirectory[username] != address(0)) {
-            revert UsernameAlreadyClaimed(username);
-        }
-
-        userDirectory[username] = msg.sender;
-        emit UserAddressUpdated(username, msg.sender);
+        emit ScheduleActive(username, token, nextPayout, amount);
     }
 
     function createStream(
@@ -107,11 +79,7 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
         address token,
         uint40 endStream
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
-        address userAddress = userDirectory[username];
-
-        if (userAddress == address(0)) {
-            revert UserNotFound(username);
-        }
+        Registry.getUserAddress(username);
 
         if (amount == 0) revert InvalidAmount();
 
@@ -123,111 +91,151 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
 
         streamPayment[username] = Stream({
             token: token,
-            startDate: _now,
             endDate: endStream,
             active: true,
             amount: amount,
             lastPayout: _now
         });
-        emit StreamActive(username, token, _now, endStream, amount);
+        emit StreamActive(username, token, endStream, amount);
     }
 
-    function executePayment(
+    function requestSchedulePayout(
         string calldata username
-    ) external auth(EXECUTE_PAYMENT_PERMISSION_ID) {
-        Schedule memory schedule = schedulePayment[username];
-        if (schedule.active && schedule.nextPayout <= block.timestamp) {
-            address recipient = userDirectory[username];
-            if (recipient == address(0)) revert UserNotFound(username);
+    ) external payable override nonReentrant {
+        Schedule memory _schedule = schedulePayment[username];
+        if (!_schedule.active) revert InActivePayment(username);
 
-            // Create action to be executed by the DAO
-            IDAO.Action[] memory actions = new IDAO.Action[](1);
+        uint40 currentTime = uint40(block.timestamp);
+        if (currentTime < _schedule.nextPayout) revert NoPayoutDue();
 
-            if (schedule.token == ETH) {
-                actions[0] = IDAO.Action({
-                    to: recipient,
-                    value: schedule.amount,
-                    data: ""
-                });
-            } else {
-                actions[0] = IDAO.Action({
-                    to: schedule.token,
-                    value: 0,
-                    data: abi.encodeCall(
-                        IERC20.transfer,
-                        (recipient, schedule.amount)
-                    )
-                });
-            }
-
-            // Execute the payment through the DAO
-            dao().execute({
-                _callId: bytes32(0),
-                _actions: actions,
-                _allowFailureMap: 0
-            });
-
-            if (schedule.isOneTime) {
-                schedule.active = false;
-            } else {
-                schedule.nextPayout = uint40(block.timestamp + 30 days);
-            }
-            schedulePayment[username] = schedule;
-
-            emit PaymentExecuted(username, schedule.token, schedule.amount);
-        }
-    }
-
-    function executeStream(
-        string calldata username
-    ) external auth(EXECUTE_PAYMENT_PERMISSION_ID) {
-        Stream memory stream = streamPayment[username];
-        if (!stream.active) revert NoActivePayment(username);
-
-        uint40 _now = uint40(block.timestamp);
-        if (_now > stream.endDate) {
-            stream.active = false;
-            streamPayment[username] = stream;
-            return;
-        }
-
-        address recipient = userDirectory[username];
+        address recipient = Registry.getUserAddress(username);
         if (recipient == address(0)) revert UserNotFound(username);
 
-        uint256 elapsedTime = _now - stream.lastPayout;
-        uint256 totalDuration = stream.endDate - stream.startDate;
-        uint256 amount = (stream.amount * elapsedTime) / totalDuration;
+        uint256 payoutAmount = _schedule.amount;
 
-        if (amount > 0) {
-            // Create action to be executed by the DAO
-            IDAO.Action[] memory actions = new IDAO.Action[](1);
+        if (_schedule.isOneTime) {
+            schedulePayment[username].active = false;
+        } else {
+            uint40 nextPayout = _schedule.nextPayout + INTERVAL;
 
-            if (stream.token == ETH) {
-                actions[0] = IDAO.Action({
-                    to: recipient,
-                    value: amount,
-                    data: ""
-                });
-            } else {
-                actions[0] = IDAO.Action({
-                    to: stream.token,
-                    value: 0,
-                    data: abi.encodeCall(IERC20.transfer, (recipient, amount))
-                });
+            // Ensure the next payout isn't set in the past and account for missed payouts
+            if (nextPayout < currentTime) {
+                uint40 missedIntervals = (currentTime - _schedule.nextPayout) /
+                    INTERVAL;
+                payoutAmount += _schedule.amount * missedIntervals;
+                nextPayout =
+                    _schedule.nextPayout +
+                    (missedIntervals + 1) *
+                    INTERVAL;
             }
 
-            // Execute the payment through the DAO
-            dao().execute({
-                _callId: bytes32(0),
-                _actions: actions,
-                _allowFailureMap: 0
-            });
-
-            stream.lastPayout = _now;
-            streamPayment[username] = stream;
-
-            emit StreamPaymentExecuted(username, stream.token, amount);
+            schedulePayment[username].nextPayout = nextPayout;
         }
+
+        // Create action to be executed by the DAO
+        IDAO.Action[] memory actions = new IDAO.Action[](1);
+
+        if (_schedule.token == ETH) {
+            actions[0] = IDAO.Action({
+                to: recipient,
+                value: payoutAmount,
+                data: ""
+            });
+        } else {
+            actions[0] = IDAO.Action({
+                to: _schedule.token,
+                value: 0,
+                data: abi.encodeCall(IERC20.transfer, (recipient, payoutAmount))
+            });
+        }
+
+        // Execute the payment through the DAO
+        dao().execute({
+            _callId: bytes32(0),
+            _actions: actions,
+            _allowFailureMap: 0
+        });
+
+        emit PaymentExecuted(username, _schedule.token, payoutAmount);
+    }
+
+    function _streamPayout(string calldata username, bool request) private {
+        Stream memory _stream = streamPayment[username];
+        if (!_stream.active) revert InActivePayment(username);
+
+        uint40 currentTime = uint40(block.timestamp);
+        if (request && currentTime < (_stream.lastPayout + 1 days))
+            revert NoPayoutDue();
+
+        address recipient = Registry.getUserAddress(username);
+        uint256 payoutAmount;
+
+        if (currentTime >= _stream.endDate) {
+            uint40 timeUntilEnd = _stream.endDate - _stream.lastPayout;
+            payoutAmount = timeUntilEnd * _stream.amount;
+            streamPayment[username].active = false;
+        } else {
+            uint40 elapsedTime = currentTime - _stream.lastPayout;
+            payoutAmount = elapsedTime * _stream.amount;
+        }
+
+        streamPayment[username].lastPayout = currentTime;
+
+        IDAO.Action[] memory actions = new IDAO.Action[](1);
+
+        if (_stream.token == ETH) {
+            actions[0] = IDAO.Action({
+                to: recipient,
+                value: payoutAmount,
+                data: ""
+            });
+        } else {
+            actions[0] = IDAO.Action({
+                to: _stream.token,
+                value: 0,
+                data: abi.encodeCall(IERC20.transfer, (recipient, payoutAmount))
+            });
+        }
+
+        // Execute the payment through the DAO
+        dao().execute({
+            _callId: bytes32(0),
+            _actions: actions,
+            _allowFailureMap: 0
+        });
+        emit Payout(username, _stream.token, payoutAmount);
+    }
+
+    // function _incompleteSchedulePayout(string calldata username) private {
+    //     Schedule memory _schedule = schedulePayment[username];
+    //     if (!_schedule.active) revert InActivePayment(username);
+
+    //     uint40 currentTime = uint40(block.timestamp);
+    //     uint40 elapsedTime = currentTime -
+    //         (_schedule.nextPayout - uint40(30 days));
+
+    //     // Calculate the prorated payment amount
+    //     uint256 proratedAmount = (elapsedTime * _schedule.amount) /
+    //         uint40(30 days);
+
+    //     address recipient = Registry.getUserAddress(username);
+    //     if (proratedAmount > 0) {
+    //         if (_schedule.token == Constants.ETH)
+    //             SafeTransferLib.safeTransferETH(recipient, proratedAmount);
+    //         else
+    //             SafeTransferLib.safeTransfer(
+    //                 ERC20(_schedule.token),
+    //                 recipient,
+    //                 proratedAmount
+    //             );
+    //         emit Payout(username, _schedule.token, proratedAmount);
+    //     }
+    // }
+
+    function requestStreamPayout(
+        string calldata username
+    ) external payable override nonReentrant {
+        _streamPayout(username, true);
     }
 
     /**
@@ -250,5 +258,53 @@ contract PaymentsPlugin is PluginUUPSUpgradeable, IPayments, Errors {
         string calldata username
     ) external view override returns (Schedule memory) {
         return schedulePayment[username];
+    }
+
+    function editSchedule(
+        string calldata username,
+        uint amount
+    ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
+        if (amount == 0) revert InvalidAmount();
+
+        Schedule memory _schedule = schedulePayment[username];
+        if (!_schedule.active) revert InActivePayment(username);
+
+        uint40 currentTimestamp = uint40(block.timestamp);
+        if ((_schedule.nextPayout - currentTimestamp) < EDIT_TIMEOUT)
+            revert NoEditAccess();
+
+        schedulePayment[username].amount = amount;
+        emit ScheduleUpdated(username, amount);
+    }
+
+    function editStream(
+        string calldata username,
+        uint amount
+    ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
+        if (amount == 0) revert InvalidAmount();
+
+        Stream memory _stream = streamPayment[username];
+        if (!_stream.active) revert InActivePayment(username);
+
+        streamPayment[username].amount = amount;
+        emit StreamUpdated(username, amount);
+    }
+
+    function cancelSchedule(
+        string calldata username
+    ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
+        // _incompleteSchedulePayout(username);
+
+        schedulePayment[username].active = false;
+        emit PaymentScheduleCancelled(username);
+    }
+
+    function cancelStream(
+        string calldata username
+    ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
+        _streamPayout(username, false);
+
+        streamPayment[username].active = false;
+        emit PaymentStreamCancelled(username);
     }
 }

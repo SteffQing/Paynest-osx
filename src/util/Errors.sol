@@ -22,6 +22,7 @@ abstract contract Errors {
     error UserNotFound(string username);
     error IncompatibleUserAddress();
     error UsernameAlreadyClaimed(string username);
+    error UserNotClaimor();
     error EmptyUsernameNotAllowed();
 
     // Payment Errors
