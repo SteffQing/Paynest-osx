@@ -8,7 +8,7 @@ contract Registry is IRegistry, Errors {
     mapping(string => address) private userDirectory;
     mapping(string => address) private userWalletDirectory;
 
-    function isContract(address addr) private pure returns (bool) {
+    function isContract(address addr) private view returns (bool) {
         uint256 size;
         assembly {
             size := extcodesize(addr)
@@ -32,11 +32,13 @@ contract Registry is IRegistry, Errors {
         address userAddress
     ) external override {
         if (isContract(userAddress)) revert IncompatibleUserAddress();
+        if (userAddress == address(0)) revert IncompatibleUserAddress();
         address claimor = userDirectory[username];
         if (msg.sender != claimor) revert UserNotClaimor();
         userWalletDirectory[username] = userAddress;
         emit UserAddressUpdated(username, userAddress);
     }
+
     function getUserAddress(
         string calldata username
     ) external view override returns (address) {

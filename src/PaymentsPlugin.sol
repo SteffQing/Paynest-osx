@@ -22,7 +22,7 @@ contract PaymentsPlugin is
 {
     using SafeERC20 for IERC20;
     IRegistry private immutable Registry =
-        IRegistry(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE); // Need to manually set this
+        IRegistry(0xf75150d730CE97C1551e97df39c0A049024e4C25); // Need to manually set this
 
     bytes32 public constant CREATE_PAYMENT_PERMISSION_ID =
         keccak256("CREATE_PAYMENT_PERMISSION");
@@ -53,7 +53,6 @@ contract PaymentsPlugin is
         uint40 oneTimePayoutDate
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
         Registry.getUserAddress(username);
-
         if (amount == 0) revert InvalidAmount();
 
         Schedule memory _schedule = schedulePayment[username];
@@ -80,7 +79,6 @@ contract PaymentsPlugin is
         uint40 endStream
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
         Registry.getUserAddress(username);
-
         if (amount == 0) revert InvalidAmount();
 
         Stream memory _stream = streamPayment[username];
@@ -109,8 +107,6 @@ contract PaymentsPlugin is
         if (currentTime < _schedule.nextPayout) revert NoPayoutDue();
 
         address recipient = Registry.getUserAddress(username);
-        if (recipient == address(0)) revert UserNotFound(username);
-
         uint256 payoutAmount = _schedule.amount;
 
         if (_schedule.isOneTime) {
@@ -159,13 +155,11 @@ contract PaymentsPlugin is
         emit PaymentExecuted(username, _schedule.token, payoutAmount);
     }
 
-    function _streamPayout(string calldata username, bool request) private {
+    function _streamPayout(string calldata username) private {
         Stream memory _stream = streamPayment[username];
         if (!_stream.active) revert InActivePayment(username);
 
         uint40 currentTime = uint40(block.timestamp);
-        if (request && currentTime < (_stream.lastPayout + 1 days))
-            revert NoPayoutDue();
 
         address recipient = Registry.getUserAddress(username);
         uint256 payoutAmount;
@@ -235,25 +229,15 @@ contract PaymentsPlugin is
     function requestStreamPayout(
         string calldata username
     ) external payable override nonReentrant {
-        _streamPayout(username, true);
+        _streamPayout(username);
     }
 
-    /**
-     * @notice Retrieves the current stream details for a user.
-     * @param username The username to query stream against.
-     * @return stream The stream information.
-     */
     function getStream(
         string calldata username
     ) external view override returns (Stream memory) {
         return streamPayment[username];
     }
 
-    /**
-     * @notice Retrieves the current schedule payment details for a user.
-     * @param username The username to query schedule against.
-     * @return schedule The schedule information.
-     */
     function getSchedule(
         string calldata username
     ) external view override returns (Schedule memory) {
@@ -302,7 +286,7 @@ contract PaymentsPlugin is
     function cancelStream(
         string calldata username
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
-        _streamPayout(username, false);
+        _streamPayout(username);
 
         streamPayment[username].active = false;
         emit PaymentStreamCancelled(username);
