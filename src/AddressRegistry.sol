@@ -17,14 +17,20 @@ contract Registry is IRegistry, Errors {
     }
 
     function claimUsername(string calldata _username) public {
-        if (bytes(_username).length == 0) {
-            revert EmptyUsernameNotAllowed();
-        }
-        if (userDirectory[_username] != address(0)) {
+        if (!isUsernameAvailable(_username)) {
             revert UsernameAlreadyClaimed(_username);
         }
         userDirectory[_username] = msg.sender;
         emit UsernameClaimed(_username, msg.sender);
+    }
+
+    function isUsernameAvailable(
+        string calldata _username
+    ) public view returns (bool) {
+        if (bytes(_username).length == 0) {
+            revert EmptyUsernameNotAllowed();
+        }
+        return userDirectory[_username] == address(0);
     }
 
     function updateUserAddress(
