@@ -35,4 +35,6 @@ abstract contract Errors {
     error NoPayoutDue();
     error NoEditAccess();
     error InvalidSubscriptionPeriod();
+    error InvalidInterval();
+    error InvalidFirstPaymentDate();
 }

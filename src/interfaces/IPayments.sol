@@ -8,46 +8,37 @@ pragma solidity ^0.8.17;
 interface IPayments {
     // Events
     event ScheduleActive(
-        string indexed username,
+        string username,
         address token,
         uint40 nextPayout,
         uint256 amount
     );
     event StreamActive(
-        string indexed username,
+        string username,
         address token,
         uint40 endDate,
-        uint256 amount
-    );
-    event PaymentExecuted(
-        string indexed username,
-        address token,
         uint256 amount
     );
 
     /**
      * @dev Emitted when a payout is successfully processed.
-     * @param username The username associated with the stream.
+     * @param username The username associated with the stream or schedule.
      * @param token The token address used for the payout.
      * @param amount The amount paid out.
      */
-    event Payout(
-        string indexed username,
-        address indexed token,
-        uint256 amount
-    );
+    event Payout(string username, address token, uint256 amount);
 
     /**
      * @dev Emitted when a payment stream is canceled.
      * @param username The username associated with the canceled stream.
      */
-    event PaymentStreamCancelled(string indexed username);
+    event PaymentStreamCancelled(string username);
 
     /**
      * @dev Emitted when a payment schedule is canceled.
      * @param username The username associated with the canceled schedule.
      */
-    event PaymentScheduleCancelled(string indexed username);
+    event PaymentScheduleCancelled(string username);
 
     /**
      * @dev Emitted when a stream is updated with a new amount.
@@ -56,7 +47,7 @@ interface IPayments {
      * @param username The username of the user whose stream has been updated.
      * @param amount The new amount set for the stream.
      */
-    event StreamUpdated(string indexed username, uint amount);
+    event StreamUpdated(string username, uint amount);
 
     /**
      * @dev Emitted when a payment schedule is updated with a new amount.
@@ -65,13 +56,21 @@ interface IPayments {
      * @param username The username of the user whose schedule has been updated.
      * @param amount The new amount set for the schedule.
      */
-    event ScheduleUpdated(string indexed username, uint amount);
+    event ScheduleUpdated(string username, uint amount);
+
+    enum IntervalType {
+        Weekly,
+        Monthly,
+        Quarterly,
+        Yearly
+    }
 
     /**
      * @dev Represents a scheduled payment, including both recurring and one-time payments.
         A mapping of username to this struct defines the payment
      * @param token The token address used for the payment.
      * @param nextPayout The timestamp when the next payment is due.
+     * @param interval The interval between each payment is due.
      * @param isOneTime Indicates whether the payment is a one-time occurrence.
      * @param active Indicates whether the payment is active 
      * @param amount The amount to be paid per interval (e.g., monthly).
@@ -79,6 +78,7 @@ interface IPayments {
     struct Schedule {
         address token;
         uint40 nextPayout;
+        IntervalType interval;
         bool isOneTime;
         bool active;
         uint256 amount;
@@ -106,13 +106,17 @@ interface IPayments {
      * @param username The username to create the schedule for
      * @param amount The amount to be paid
      * @param token The token address to be used for payment
-     * @param oneTimePayoutDate If non-zero, creates a one-time payment at this date
+     * @param interval The interval between each scheduled payout
+     * @param isOneTime A check to set schedule to go out once
+     * @param firstPaymentDate Date of first payment
      */
     function createSchedule(
         string calldata username,
         uint256 amount,
         address token,
-        uint40 oneTimePayoutDate
+        IntervalType interval,
+        bool isOneTime,
+        uint40 firstPaymentDate
     ) external;
 
     /**
@@ -151,8 +155,11 @@ interface IPayments {
      * @notice Requests a payout of accumulated funds.
      * @dev Allows anyone to request a payout of funds from the contract.
      * @param username The username of the recipient who will receive the payment.
+     * @return payoutAmount The stream payout value.
      */
-    function requestStreamPayout(string calldata username) external payable;
+    function requestStreamPayout(
+        string calldata username
+    ) external payable returns (uint256 payoutAmount);
 
     /**
      * @notice Requests a payout of scheduled funds.
@@ -172,8 +179,12 @@ interface IPayments {
      * @notice Cancels an active payment schedule with prorated payout for the current interval.
      * @dev Computes and transfers the prorated amount for the current interval, then disables the schedule.
      * @param username The username associated with the payment schedule.
+     * @param payIncomplete A check to tell contract to pay username according to prorated schedule.
      */
-    function cancelSchedule(string calldata username) external;
+    function cancelSchedule(
+        string calldata username,
+        bool payIncomplete
+    ) external;
 
     /**
      * @dev Edits the amount for an active stream for a given user.
@@ -211,4 +222,8 @@ interface IPayments {
      * - A `ScheduleUpdated` event with the updated schedule information.
      */
     function editSchedule(string calldata username, uint amount) external;
+}
+
+interface IPaynest {
+    function getRegistry() external returns (address);
 }

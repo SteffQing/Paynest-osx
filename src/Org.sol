@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.17;
 
-import {IPayments} from "./interfaces/IPayments.sol";
+import {IPayments, IPaynest} from "./interfaces/IPayments.sol";
 import {Owner} from "./util/Owner.sol";
 import {Errors} from "./util/Errors.sol";
 import {SafeERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -14,15 +14,10 @@ import "./lib/SafeTransferLib.sol";
  * @title Org
  * @notice A contract that manages payment schedules and streams.
  */
-contract Org is
-    IPayments,
-    Errors,
-    Owner,
-    ReentrancyGuard
-{
+contract Org is IPayments, Errors, Owner, ReentrancyGuard {
     using SafeERC20 for IERC20;
-    IRegistry private immutable Registry =
-        IRegistry(0xf75150d730CE97C1551e97df39c0A049024e4C25); // Need to manually set this
+    IRegistry private immutable Registry;
+    bytes32 public immutable orgName;
 
     address internal constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
     uint40 private constant INTERVAL = uint40(30 days);
@@ -31,15 +26,32 @@ contract Org is
     mapping(string => Schedule) private schedulePayment;
     mapping(string => Stream) private streamPayment;
 
-    constructor(address _owner, string memory _name) payable Owner(_owner) {}
+    /// NOTE: This contract must be deployed via Paynest. msg.sender is expected to implement getRegistry().
+    constructor(address _owner, string memory _name) payable Owner(_owner) {
+        Registry = IRegistry(IPaynest(msg.sender).getRegistry());
+        require(bytes(_name).length <= 32, "Org name too long");
+        orgName = bytes32(bytes(_name));
+    }
 
     receive() external payable {}
+
+    function getIntervalDuration(
+        IntervalType interval
+    ) internal pure returns (uint40) {
+        if (interval == IntervalType.Weekly) return 7 days;
+        if (interval == IntervalType.Monthly) return 30 days;
+        if (interval == IntervalType.Quarterly) return 90 days;
+        if (interval == IntervalType.Yearly) return 365 days;
+        revert InvalidInterval();
+    }
 
     function createSchedule(
         string calldata username,
         uint256 amount,
         address token,
-        uint40 oneTimePayoutDate
+        IntervalType interval,
+        bool isOneTime,
+        uint40 firstPaymentDate
     ) external override {
         onlyOwner();
         Registry.getUserAddress(username);
@@ -49,12 +61,18 @@ contract Org is
         if (_schedule.active) revert ActivePayment(username);
 
         uint40 _now = uint40(block.timestamp);
-        bool isOneTime = oneTimePayoutDate > _now;
-        uint40 nextPayout = isOneTime ? oneTimePayoutDate : (_now + INTERVAL);
+        if (isOneTime && firstPaymentDate < _now)
+            revert InvalidFirstPaymentDate();
+
+        uint40 payoutInterval = getIntervalDuration(interval);
+        uint40 nextPayout = isOneTime
+            ? firstPaymentDate
+            : (_now + payoutInterval);
 
         schedulePayment[username] = Schedule(
             token,
             nextPayout,
+            interval,
             isOneTime,
             true,
             amount
@@ -103,21 +121,22 @@ contract Org is
         if (_schedule.isOneTime) {
             schedulePayment[username].active = false;
         } else {
-            uint40 nextPayout = _schedule.nextPayout + INTERVAL;
+            uint40 payoutInterval = getIntervalDuration(_schedule.interval);
+            uint40 nextPayout = _schedule.nextPayout + payoutInterval;
 
             // Ensure the next payout isn't set in the past and account for missed payouts
             if (nextPayout < currentTime) {
                 uint40 missedIntervals = (currentTime - _schedule.nextPayout) /
-                    INTERVAL;
+                    payoutInterval;
                 payoutAmount += _schedule.amount * missedIntervals;
                 nextPayout =
                     _schedule.nextPayout +
                     (missedIntervals + 1) *
-                    INTERVAL;
+                    payoutInterval;
             }
 
             schedulePayment[username].nextPayout = nextPayout;
-        }      
+        }
 
         if (_schedule.token == ETH)
             SafeTransferLib.safeTransferETH(recipient, payoutAmount);
@@ -128,17 +147,17 @@ contract Org is
                 payoutAmount
             );
 
-        emit PaymentExecuted(username, _schedule.token, payoutAmount);
+        emit Payout(username, _schedule.token, payoutAmount);
     }
 
-    function _streamPayout(string calldata username) private {
+    function _streamPayout(
+        string calldata username
+    ) private returns (uint256 payoutAmount) {
         Stream memory _stream = streamPayment[username];
         if (!_stream.active) revert InActivePayment(username);
 
         uint40 currentTime = uint40(block.timestamp);
-
         address recipient = Registry.getUserAddress(username);
-        uint256 payoutAmount;
 
         if (currentTime >= _stream.endDate) {
             uint40 timeUntilEnd = _stream.endDate - _stream.lastPayout;
@@ -163,36 +182,37 @@ contract Org is
         emit Payout(username, _stream.token, payoutAmount);
     }
 
-    // function _incompleteSchedulePayout(string calldata username) private {
-    //     Schedule memory _schedule = schedulePayment[username];
-    //     if (!_schedule.active) revert InActivePayment(username);
+    function _incompleteSchedulePayout(string calldata username) private {
+        Schedule memory _schedule = schedulePayment[username];
+        if (!_schedule.active) revert InActivePayment(username);
 
-    //     uint40 currentTime = uint40(block.timestamp);
-    //     uint40 elapsedTime = currentTime -
-    //         (_schedule.nextPayout - uint40(30 days));
+        uint40 currentTime = uint40(block.timestamp);
+        uint40 payoutInterval = getIntervalDuration(_schedule.interval);
+        uint40 elapsedTime = currentTime -
+            (_schedule.nextPayout - payoutInterval);
 
-    //     // Calculate the prorated payment amount
-    //     uint256 proratedAmount = (elapsedTime * _schedule.amount) /
-    //         uint40(30 days);
+        // Calculate the prorated payment amount
+        uint256 proratedAmount = (elapsedTime * _schedule.amount) /
+            payoutInterval;
 
-    //     address recipient = Registry.getUserAddress(username);
-    //     if (proratedAmount > 0) {
-    //         if (_schedule.token == Constants.ETH)
-    //             SafeTransferLib.safeTransferETH(recipient, proratedAmount);
-    //         else
-    //             SafeTransferLib.safeTransfer(
-    //                 ERC20(_schedule.token),
-    //                 recipient,
-    //                 proratedAmount
-    //             );
-    //         emit Payout(username, _schedule.token, proratedAmount);
-    //     }
-    // }
+        address recipient = Registry.getUserAddress(username);
+        if (proratedAmount > 0) {
+            if (_schedule.token == ETH)
+                SafeTransferLib.safeTransferETH(recipient, proratedAmount);
+            else
+                SafeTransferLib.safeTransfer(
+                    ERC20(_schedule.token),
+                    recipient,
+                    proratedAmount
+                );
+            emit Payout(username, _schedule.token, proratedAmount);
+        }
+    }
 
     function requestStreamPayout(
         string calldata username
-    ) external payable override nonReentrant {
-        _streamPayout(username);
+    ) external payable override nonReentrant returns (uint256 payoutAmount) {
+        payoutAmount = _streamPayout(username);
     }
 
     function getStream(
@@ -240,18 +260,17 @@ contract Org is
     }
 
     function cancelSchedule(
-        string calldata username
+        string calldata username,
+        bool payIncomplete
     ) external override {
         onlyOwner();
-        // _incompleteSchedulePayout(username);
+        if (payIncomplete) _incompleteSchedulePayout(username);
 
         schedulePayment[username].active = false;
         emit PaymentScheduleCancelled(username);
     }
 
-    function cancelStream(
-        string calldata username
-    ) external override {
+    function cancelStream(string calldata username) external override {
         onlyOwner();
         _streamPayout(username);
 

@@ -5,7 +5,6 @@ import "forge-std/Test.sol";
 import {Paynest} from "../src/factory/Paynest.sol";
 import {Org} from "../src/Org.sol";
 
-
 contract PaynestDAOTest is Test {
     Paynest paynest;
     address owner;
@@ -14,8 +13,8 @@ contract PaynestDAOTest is Test {
         uint256 privKey = vm.envUint("DEPLOYMENT_PRIVATE_KEY");
         console.log("Start");
         owner = vm.addr(privKey);
-        
-        paynest = new Paynest();
+
+        paynest = new Paynest(owner);
     }
 
     function testCreateDao() public {

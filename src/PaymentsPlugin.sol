@@ -46,11 +46,23 @@ contract PaymentsPlugin is
         __PluginUUPSUpgradeable_init(_dao);
     }
 
+    function getIntervalDuration(
+        IntervalType interval
+    ) internal pure returns (uint40) {
+        if (interval == IntervalType.Weekly) return 7 days;
+        if (interval == IntervalType.Monthly) return 30 days;
+        if (interval == IntervalType.Quarterly) return 90 days;
+        if (interval == IntervalType.Yearly) return 365 days;
+        revert InvalidInterval();
+    }
+
     function createSchedule(
         string calldata username,
         uint256 amount,
         address token,
-        uint40 oneTimePayoutDate
+        IntervalType interval,
+        bool isOneTime,
+        uint40 firstPaymentDate
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
         Registry.getUserAddress(username);
         if (amount == 0) revert InvalidAmount();
@@ -59,12 +71,18 @@ contract PaymentsPlugin is
         if (_schedule.active) revert ActivePayment(username);
 
         uint40 _now = uint40(block.timestamp);
-        bool isOneTime = oneTimePayoutDate > _now;
-        uint40 nextPayout = isOneTime ? oneTimePayoutDate : (_now + INTERVAL);
+        if (isOneTime && firstPaymentDate < _now)
+            revert InvalidFirstPaymentDate();
+
+        uint40 payoutInterval = getIntervalDuration(interval);
+        uint40 nextPayout = isOneTime
+            ? firstPaymentDate
+            : (_now + payoutInterval);
 
         schedulePayment[username] = Schedule(
             token,
             nextPayout,
+            interval,
             isOneTime,
             true,
             amount
@@ -112,17 +130,18 @@ contract PaymentsPlugin is
         if (_schedule.isOneTime) {
             schedulePayment[username].active = false;
         } else {
-            uint40 nextPayout = _schedule.nextPayout + INTERVAL;
+            uint40 payoutInterval = getIntervalDuration(_schedule.interval);
+            uint40 nextPayout = _schedule.nextPayout + payoutInterval;
 
             // Ensure the next payout isn't set in the past and account for missed payouts
             if (nextPayout < currentTime) {
                 uint40 missedIntervals = (currentTime - _schedule.nextPayout) /
-                    INTERVAL;
+                    payoutInterval;
                 payoutAmount += _schedule.amount * missedIntervals;
                 nextPayout =
                     _schedule.nextPayout +
                     (missedIntervals + 1) *
-                    INTERVAL;
+                    payoutInterval;
             }
 
             schedulePayment[username].nextPayout = nextPayout;
@@ -152,17 +171,17 @@ contract PaymentsPlugin is
             _allowFailureMap: 0
         });
 
-        emit PaymentExecuted(username, _schedule.token, payoutAmount);
+        emit Payout(username, _schedule.token, payoutAmount);
     }
 
-    function _streamPayout(string calldata username) private {
+    function _streamPayout(
+        string calldata username
+    ) private returns (uint256 payoutAmount) {
         Stream memory _stream = streamPayment[username];
         if (!_stream.active) revert InActivePayment(username);
 
         uint40 currentTime = uint40(block.timestamp);
-
         address recipient = Registry.getUserAddress(username);
-        uint256 payoutAmount;
 
         if (currentTime >= _stream.endDate) {
             uint40 timeUntilEnd = _stream.endDate - _stream.lastPayout;
@@ -200,36 +219,54 @@ contract PaymentsPlugin is
         emit Payout(username, _stream.token, payoutAmount);
     }
 
-    // function _incompleteSchedulePayout(string calldata username) private {
-    //     Schedule memory _schedule = schedulePayment[username];
-    //     if (!_schedule.active) revert InActivePayment(username);
+    function _incompleteSchedulePayout(string calldata username) private {
+        Schedule memory _schedule = schedulePayment[username];
+        if (!_schedule.active) revert InActivePayment(username);
 
-    //     uint40 currentTime = uint40(block.timestamp);
-    //     uint40 elapsedTime = currentTime -
-    //         (_schedule.nextPayout - uint40(30 days));
+        uint40 currentTime = uint40(block.timestamp);
+        uint40 payoutInterval = getIntervalDuration(_schedule.interval);
+        uint40 elapsedTime = currentTime -
+            (_schedule.nextPayout - payoutInterval);
 
-    //     // Calculate the prorated payment amount
-    //     uint256 proratedAmount = (elapsedTime * _schedule.amount) /
-    //         uint40(30 days);
+        // Calculate the prorated payment amount
+        uint256 proratedAmount = (elapsedTime * _schedule.amount) /
+            payoutInterval;
 
-    //     address recipient = Registry.getUserAddress(username);
-    //     if (proratedAmount > 0) {
-    //         if (_schedule.token == Constants.ETH)
-    //             SafeTransferLib.safeTransferETH(recipient, proratedAmount);
-    //         else
-    //             SafeTransferLib.safeTransfer(
-    //                 ERC20(_schedule.token),
-    //                 recipient,
-    //                 proratedAmount
-    //             );
-    //         emit Payout(username, _schedule.token, proratedAmount);
-    //     }
-    // }
+        address recipient = Registry.getUserAddress(username);
+        if (proratedAmount > 0) {
+            IDAO.Action[] memory actions = new IDAO.Action[](1);
+
+            if (_schedule.token == ETH) {
+                actions[0] = IDAO.Action({
+                    to: recipient,
+                    value: proratedAmount,
+                    data: ""
+                });
+            } else {
+                actions[0] = IDAO.Action({
+                    to: _schedule.token,
+                    value: 0,
+                    data: abi.encodeCall(
+                        IERC20.transfer,
+                        (recipient, proratedAmount)
+                    )
+                });
+            }
+
+            // Execute the payment through the DAO
+            dao().execute({
+                _callId: bytes32(0),
+                _actions: actions,
+                _allowFailureMap: 0
+            });
+            emit Payout(username, _schedule.token, proratedAmount);
+        }
+    }
 
     function requestStreamPayout(
         string calldata username
-    ) external payable override nonReentrant {
-        _streamPayout(username);
+    ) external payable override nonReentrant returns (uint256 payoutAmount) {
+        payoutAmount = _streamPayout(username);
     }
 
     function getStream(
@@ -275,9 +312,10 @@ contract PaymentsPlugin is
     }
 
     function cancelSchedule(
-        string calldata username
+        string calldata username,
+        bool payIncomplete
     ) external override auth(CREATE_PAYMENT_PERMISSION_ID) {
-        // _incompleteSchedulePayout(username);
+        if (payIncomplete) _incompleteSchedulePayout(username);
 
         schedulePayment[username].active = false;
         emit PaymentScheduleCancelled(username);
