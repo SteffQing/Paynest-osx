@@ -59,6 +59,7 @@ interface IPayments {
     event ScheduleUpdated(string username, uint amount);
 
     enum IntervalType {
+        None,
         Weekly,
         Monthly,
         Quarterly,

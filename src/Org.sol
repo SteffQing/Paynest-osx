@@ -38,6 +38,7 @@ contract Org is IPayments, Errors, Owner, ReentrancyGuard {
     function getIntervalDuration(
         IntervalType interval
     ) internal pure returns (uint40) {
+        if (interval == IntervalType.None) return 0;
         if (interval == IntervalType.Weekly) return 7 days;
         if (interval == IntervalType.Monthly) return 30 days;
         if (interval == IntervalType.Quarterly) return 90 days;
@@ -54,30 +55,25 @@ contract Org is IPayments, Errors, Owner, ReentrancyGuard {
         uint40 firstPaymentDate
     ) external override {
         onlyOwner();
+
         Registry.getUserAddress(username);
         if (amount == 0) revert InvalidAmount();
-
-        Schedule memory _schedule = schedulePayment[username];
-        if (_schedule.active) revert ActivePayment(username);
+        if (schedulePayment[username].active) revert ActivePayment(username);
 
         uint40 _now = uint40(block.timestamp);
-        if (isOneTime && firstPaymentDate < _now)
-            revert InvalidFirstPaymentDate();
-
-        uint40 payoutInterval = getIntervalDuration(interval);
-        uint40 nextPayout = isOneTime
-            ? firstPaymentDate
-            : (_now + payoutInterval);
+        if (firstPaymentDate < _now + 1) revert InvalidFirstPaymentDate();
+        if (!isOneTime && interval == IntervalType.None)
+            revert InvalidInterval();
 
         schedulePayment[username] = Schedule(
             token,
-            nextPayout,
+            firstPaymentDate,
             interval,
             isOneTime,
             true,
             amount
         );
-        emit ScheduleActive(username, token, nextPayout, amount);
+        emit ScheduleActive(username, token, firstPaymentDate, amount);
     }
 
     function createStream(
@@ -90,9 +86,7 @@ contract Org is IPayments, Errors, Owner, ReentrancyGuard {
         Registry.getUserAddress(username);
         if (amount == 0) revert InvalidAmount();
 
-        Stream memory _stream = streamPayment[username];
-        if (_stream.active) revert ActivePayment(username);
-
+        if (streamPayment[username].active) revert ActivePayment(username);
         uint40 _now = uint40(block.timestamp);
         if (endStream <= _now) revert InvalidEndDate();
 
@@ -125,6 +119,22 @@ contract Org is IPayments, Errors, Owner, ReentrancyGuard {
             uint40 nextPayout = _schedule.nextPayout + payoutInterval;
 
             // Ensure the next payout isn't set in the past and account for missed payouts
+            // NOTE:
+            // This payout logic assumes an "eager payout" model.
+            // That means:
+            // - Payouts are allowed once the current time has passed the `nextPayout` timestamp.
+            // - We calculate how many full intervals have passed since `nextPayout`.
+            // - We then pay for all of them, including the current interval if it has already started.
+            // - The `nextPayout` is advanced by (missedIntervals + 1) * interval duration to point to the *next unpaid interval*.
+            //
+            // Example:
+            //   - Interval: 7 days
+            //   - nextPayout = April 1
+            //   - currentTime = April 18
+            //   → Missed intervals = 3 (April 1, April 8 & April 15 started)
+            //   → We pay for 3 intervals (April 1, 8, 15)
+            //   → nextPayout becomes April 22 (missedIntervals + 1)
+
             if (nextPayout < currentTime) {
                 uint40 missedIntervals = (currentTime - _schedule.nextPayout) /
                     payoutInterval;
@@ -254,6 +264,8 @@ contract Org is IPayments, Errors, Owner, ReentrancyGuard {
 
         Stream memory _stream = streamPayment[username];
         if (!_stream.active) revert InActivePayment(username);
+
+        _streamPayout(username);
 
         streamPayment[username].amount = amount;
         emit StreamUpdated(username, amount);
